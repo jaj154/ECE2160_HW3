@@ -77,3 +77,39 @@ These are patterns typically seen on a stock, non-RT Raspberry Pi OS kernel. You
 Competition for the CPU under the default scheduler is usually the largest effect. When runnable compute or data threads outnumber free cores, a SCHED_OTHER sampler can wait milliseconds for its turn. Fewer cores makes this worse, which is why the `cores` group often looks dramatic. Requesting a real-time priority (`-s fifo`) usually collapses that tail by an order of magnitude or more. This is why OS priority is often the single biggest lever; nice values help far less. After priority is fixed, what remains comes from things the scheduler cannot preempt. These include interrupt and kernel work from storage writeback (`-S`) and networking, contention in the shared L3/DRAM from the data unit, and, once RAM runs out, page reclaim and swapping. Paging can produce the worst single stalls of all, and `mlockall` (`-l`) protects the sampler from it. CPU speed mostly scales how long the *work* takes (see `work_p99_us` with `-r`) and matters less for wake-up latency, except through idle states and thermal throttling.
 
 For the write-up, a useful framing is that the mean barely moves between most configurations, while the tail moves by orders of magnitude. That gap is the predictability problem, and oversampling can only hide it if you know how long the tail is.
+
+## CPU preflight (added after the first Pi 5 run)
+
+The first sweep silently ran on a single CPU (`online_cpus = allowed_cpus = 1` in every row), which invalidated the core-count experiment. `run_experiments.sh` now checks before anything runs:
+
+1. If cores exist but are offline, it brings them online (needs `sudo`).
+2. If the shell inherited a restricted CPU mask, it widens it.
+3. If fewer CPUs than expected are still usable (4 on a Pi 5), it stops and prints likely causes (`maxcpus=` / `nr_cpus=` in the kernel command line, offlined cores, container limits) plus recent kernel messages. Override with `ALLOW_FEWER_CPUS=1` (single-core results only).
+
+Pinned runs now use the real last CPU for the sampler and keep the load on the others. The `cores` group sweeps 1..N cores with the same 7-thread load (`cores-N`) and with N-1 compute threads so one core stays free (`coresfit-N`). After the sweep, `cpu_check.txt` compares each run's reported CPU count with what it should have been.
+
+## Mechanism tests (`mech` group, `-Q` attribution mode)
+
+Added so that the causal explanations in the paper can be tested instead of inferred.
+
+`-Q` records, for every sample, how long the sampler thread was runnable but waiting for a CPU
+(from `/proc/thread-self/schedstat`). With `-r` it also splits each sensor read into CPU time, runqueue
+wait and *blocked* time (neither running nor runnable), and counts voluntary and involuntary context
+switches. A voluntary switch means the thread went to sleep itself (blocked on a lock or device);
+an involuntary one means it was preempted.
+
+```bash
+sudo ./run_experiments.sh mech          # about 5 minutes
+```
+
+| Question | Runs | What to look for |
+|---|---|---|
+| Is the ~4 ms late-wake-up ceiling CPU waiting? | `mech-q_c1/2/4/8` | `median wait/lat` near 1 means the lateness is runqueue wait; does the ceiling change with thread count? |
+| What causes the sensor-read stall? | `mech-sens_*` remove one contender at a time (compute, data, network, I/O unit) | which load makes the stall appear; the I/O unit alone (`i1`, `i2`) tests the shared-sysfs-node hypothesis |
+| Is the stall blocking or CPU wait? | same runs with SCHED_FIFO (`mech-sens_fifo_*`) | stalls that survive FIFO with low CPU and wait share and a voluntary switch are blocking |
+
+Results: `results/mechanism_report.txt`, `results/mechanism_summary.csv`, `results/plots/mechanism_*.png`.
+Run it only after the CPU preflight reports all four cores usable.
+
+To build on a machine without the Pi thermal node (testing only):
+`gcc -O2 -pthread -DTHERMAL_PATH='"/proc/loadavg"' -o critter_predict critter_predict.c -lm`

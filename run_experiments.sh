@@ -13,8 +13,16 @@
 #          sleep   sleep API and the observer effect of printing
 #          period  sample period
 #          sensor  sampler actually reads the thermal sensor each period
+#          mech    mechanism tests (-Q): is lateness CPU wait or blocking? who causes the
+#                  sensor-read stall? does the ~4 ms ceiling depend on thread count?
 #
 # Environment overrides: N=10000 PERIOD=1000 OUT=results COOL_C=55 KEEP=0
+#                        ALLOW_FEWER_CPUS=1   run even if not all cores are online
+#
+# CPU preflight: before anything runs, the script checks that every core is
+# online and usable. Offline cores are brought online (root), a restricted
+# affinity mask is widened, and if cores are still missing the script stops
+# with a diagnosis instead of silently measuring a single-core system.
 set -u
 cd "$(dirname "$0")"
 
@@ -27,8 +35,64 @@ MIX="-c 2 -d 2 -i 1 -N 1"          # "whole Critter" background load
 CPUFREQ=/sys/devices/system/cpu/cpufreq/policy0
 THERM=/sys/class/thermal/thermal_zone0/temp
 
+# ------------------------------------------------------------ CPU preflight
+cpu_count() {   # "0-3,5" -> 5
+    local n=0 part a b
+    local IFS=','
+    for part in $1; do
+        [ -z "$part" ] && continue
+        if [[ $part == *-* ]]; then a=${part%-*}; b=${part#*-}; n=$((n + b - a + 1)); else n=$((n + 1)); fi
+    done
+    echo "$n"
+}
+cpu_sys() { cat "/sys/devices/system/cpu/$1" 2>/dev/null || echo ""; }
+allowed_list() { awk '/Cpus_allowed_list/ {print $2}' /proc/self/status; }
+
+CPU_PRESENT=$(cpu_sys present)
+CPU_ONLINE=$(cpu_sys online)
+NPRESENT=$(cpu_count "${CPU_PRESENT:-0}")
+NONLINE=$(cpu_count "${CPU_ONLINE:-0}")
+EXPECT=$NPRESENT
+grep -aq "Raspberry Pi 5" /proc/device-tree/model 2>/dev/null && EXPECT=4
+
+# 1) cores that exist but are offline: try to bring them online (needs root)
+if [ "$NONLINE" -lt "$NPRESENT" ]; then
+    echo "!! CPU preflight: $NONLINE of $NPRESENT present CPUs are online (online=$CPU_ONLINE present=$CPU_PRESENT)"
+    if [ "$(id -u)" -eq 0 ]; then
+        for f in /sys/devices/system/cpu/cpu[0-9]*/online; do
+            [ -e "$f" ] && [ "$(cat "$f")" = 0 ] && echo 1 > "$f" && echo "   brought $(basename "$(dirname "$f")") online"
+        done
+        CPU_ONLINE=$(cpu_sys online); NONLINE=$(cpu_count "${CPU_ONLINE:-0}")
+    else
+        echo "   (run with sudo so offline cores can be brought online)"
+    fi
+fi
+
+# 2) this shell inherited a restricted affinity (systemd, taskset, cpuset): widen it
+if [ "$(cpu_count "$(allowed_list)")" -lt "$NONLINE" ]; then
+    echo "!! CPU preflight: this shell is limited to CPUs $(allowed_list), widening to $CPU_ONLINE"
+    taskset -pc "$CPU_ONLINE" $$ >/dev/null 2>&1 || echo "   could not widen affinity"
+fi
+NCPU=$(cpu_count "$(allowed_list)")
+LAST=$((NCPU - 1))
+
+# 3) still short: stop and explain, unless the user insists
+if [ "$NCPU" -lt "$EXPECT" ] && [ "${ALLOW_FEWER_CPUS:-0}" != 1 ]; then
+    echo
+    echo "ERROR: only $NCPU of $EXPECT expected CPUs are usable, so the core-count and priority"
+    echo "       experiments would be meaningless. Likely causes:"
+    echo "  - kernel parameter in /boot/firmware/cmdline.txt: $(grep -o -E 'maxcpus=[0-9]+|nr_cpus=[0-9]+|nosmp|isolcpus=[^ ]*' /proc/cmdline | tr '\n' ' ')(none found if blank)"
+    echo "  - cores offlined by a power-saving tool or an earlier experiment"
+    echo "  - running in a container or VM with a CPU limit"
+    echo "  Details: online=$CPU_ONLINE present=$CPU_PRESENT possible=$(cpu_sys possible) offline=$(cpu_sys offline)"
+    echo "  Kernel messages:"; dmesg 2>/dev/null | grep -i -E "smp|psci|cpu[0-9]|secondary" | tail -8 | sed 's/^/    /'
+    echo "  To run anyway (single-core results only): ALLOW_FEWER_CPUS=1 $0 $*"
+    exit 1
+fi
+echo "CPU preflight OK: $NCPU CPUs usable (online=$CPU_ONLINE)"
+
 SEL=("$@")
-[ ${#SEL[@]} -eq 0 ] && SEL=(type prio cores freq ram sleep period sensor)
+[ ${#SEL[@]} -eq 0 ] && SEL=(type prio cores freq ram sleep period sensor mech)
 
 IS_ROOT=0
 [ "$(id -u)" -eq 0 ] && IS_ROOT=1
@@ -77,6 +141,8 @@ root_run() {
     echo "freqs: $(cat $CPUFREQ/scaling_available_frequencies 2>/dev/null)"
     echo "kernel preempt: $(uname -v | grep -oE 'PREEMPT[_A-Z]*' | head -1)"
     echo "cmdline: $(cat /proc/cmdline)"
+    echo "cpu present=$(cpu_sys present) online=$(cpu_sys online) offline=$(cpu_sys offline) allowed=$(allowed_list) usable=$NCPU"
+    echo "nproc: $(nproc)"
     echo "start temp: $(temp_c) C, $(throttled)"
     echo "sched_rt_runtime_us: $(cat /proc/sys/kernel/sched_rt_runtime_us)"
 } > "$OUT/environment.txt"
@@ -96,17 +162,28 @@ fi
 if want prio; then
     run      prio-nice0                       "" $MIX
     run      prio-slack1                      "" $MIX -t 1
-    run      prio-pinned                      "" $MIX -a 3 -A 0-2
     root_run prio-nice-20                     "" $MIX -s other -P -20
     root_run prio-fifo80                      "" $MIX -s fifo -P 80
-    root_run prio-fifo80_pinned               "" $MIX -s fifo -P 80 -a 3 -A 0-2
-    root_run prio-fifo80_pinned_mlock_slack1  "" $MIX -s fifo -P 80 -a 3 -A 0-2 -l -t 1
+    if [ "$NCPU" -ge 2 ]; then
+        # sampler alone on the last core, all load on the others
+        PIN="-a $LAST -A 0-$((LAST - 1))"
+        run      prio-pinned                      "" $MIX $PIN
+        root_run prio-fifo80_pinned               "" $MIX -s fifo -P 80 $PIN
+        root_run prio-fifo80_pinned_mlock_slack1  "" $MIX -s fifo -P 80 $PIN -l -t 1
+    else
+        echo "--- skip pinned runs (only one CPU)"
+    fi
 fi
 
 # ---------------------------------------------------------- number of cores
 if want cores; then
-    for n in 1 2 3 4; do
+    for n in $(seq 1 "$NCPU"); do
+        # same 7-thread load on n cores (oversubscribed unless n is large)
         run "cores-${n}" "taskset -c 0-$((n - 1))" $MIX
+    done
+    for n in $(seq 2 "$NCPU"); do
+        # n-1 compute threads on n cores: one core stays free for the sampler
+        run "coresfit-${n}" "taskset -c 0-$((n - 1))" -c $((n - 1))
     done
 fi
 
@@ -189,10 +266,44 @@ if want sensor; then
     root_run sensor-read_fifo_mix "" -r -m abs $MIX -s fifo -P 80
 fi
 
+# --------------------------------------------- mechanism tests (attribution -Q)
+if want mech; then
+    # Q1/quantum: does the late-wake-up ceiling depend on how many threads share the CPU?
+    for n in 1 2 4 8; do
+        run "mech-q_c${n}" "" -Q -c "$n"
+    done
+    # Q2: who causes the sensor-read stall? Remove one contender at a time.
+    run "mech-sens_none"    "" -Q -r -m abs
+    run "mech-sens_c2"      "" -Q -r -m abs -c 2
+    run "mech-sens_d2"      "" -Q -r -m abs -d 2
+    run "mech-sens_n1"      "" -Q -r -m abs -N 1
+    run "mech-sens_i1"      "" -Q -r -m abs -i 1
+    run "mech-sens_i2"      "" -Q -r -m abs -i 2
+    run "mech-sens_mixnoio" "" -Q -r -m abs -c 2 -d 2 -N 1
+    run "mech-sens_mix"     "" -Q -r -m abs $MIX
+    # same with real-time priority: if the stall survives, it is blocking, not CPU wait
+    root_run "mech-sens_fifo_i1"      "" -Q -r -m abs -i 1 -s fifo -P 80
+    root_run "mech-sens_fifo_mixnoio" "" -Q -r -m abs -c 2 -d 2 -N 1 -s fifo -P 80
+    root_run "mech-sens_fifo_mix"     "" -Q -r -m abs $MIX -s fifo -P 80
+fi
+
+# verify each run really had the CPUs it was supposed to (columns: 1=label 17=allowed_cpus)
+echo
+awk -F, -v ncpu="$NCPU" 'NR>1 {
+    want = ncpu
+    if ($1 ~ /^cores-[0-9]+$/ || $1 ~ /^coresfit-[0-9]+$/) { split($1, a, "-"); want = a[2] }
+    if ($17 != want) { bad++; printf "CPU MISMATCH: %s ran with %s CPUs, expected %s\n", $1, $17, want }
+    n++ }
+  END { if (bad) printf "!! %d of %d runs had the wrong CPU count -- do not trust those rows\n", bad, n;
+        else printf "CPU check: all %d runs used the expected number of CPUs\n", n }' "$SUM" | tee "$OUT/cpu_check.txt"
+
 echo
 echo "Done. Summary: $SUM"
 if command -v python3 >/dev/null && [ -f plot_results.py ]; then
     python3 plot_results.py "$OUT" || echo "plotting failed (sudo apt install python3-matplotlib)"
+fi
+if want mech && command -v python3 >/dev/null && [ -f analyze_mechanism.py ]; then
+    python3 analyze_mechanism.py "$OUT" | tee "$OUT/mechanism_report.txt" || echo "mechanism analysis failed"
 fi
 
 # hand results back to the normal user when run with sudo

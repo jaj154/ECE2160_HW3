@@ -57,7 +57,9 @@
 #include <unistd.h>
 
 #define NS_PER_SEC   1000000000LL
+#ifndef THERMAL_PATH   /* override with -DTHERMAL_PATH='"/path"' to test on other machines */
 #define THERMAL_PATH "/sys/class/thermal/thermal_zone0/temp"
+#endif
 #define FREQ_PATH    "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
 #define MAX_THREADS  64
 
@@ -73,6 +75,7 @@ typedef struct {
     int  sleep_mode;
     int  read_sensor;
     int  live_print;
+    int  attrib;          /* -Q: scheduler-attribution columns */
     long deadline_us;
     long warmup_ms;
 
@@ -120,6 +123,12 @@ typedef struct {
     int64_t work_ns;      /* time spent reading the sensor (-r) */
     int64_t interval_ns;  /* time between consecutive wake-ups */
     int32_t temp_mc;      /* sensor value in milli-degrees C (-r) */
+    /* -Q attribution (zero unless enabled) */
+    int64_t sleep_wait_ns; /* runnable-but-not-running time during sleep+wake */
+    int64_t rd_cpu_ns;     /* CPU time consumed during the sensor read */
+    int64_t rd_wait_ns;    /* runqueue wait time during the sensor read */
+    int32_t rd_vcsw;       /* voluntary context switches during the read */
+    int32_t rd_ivcsw;      /* involuntary context switches during the read */
 } sample_t;
 
 /* ------------------------------------------------------------------------ */
@@ -162,6 +171,30 @@ static double read_temp_c(void)
 {
     long v = read_sysfs_long(THERMAL_PATH);
     return v < 0 ? -1.0 : v / 1000.0;
+}
+
+/* Runqueue wait of the calling thread, from /proc/thread-self/schedstat:
+ * fields are "cpu_ns wait_ns timeslices". Wait time is credited when the
+ * thread is next switched in, so a read after a wake-up includes that wake-up. */
+static int read_wait_ns(int fd, int64_t *wait)
+{
+    char b[128];
+    unsigned long long run, w, sl;
+    ssize_t n = pread(fd, b, sizeof b - 1, 0);
+    if (n <= 0)
+        return -1;
+    b[n] = '\0';
+    if (sscanf(b, "%llu %llu %llu", &run, &w, &sl) != 3)
+        return -1;
+    *wait = (int64_t)w;
+    return 0;
+}
+
+static inline int64_t thread_cpu_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return ts_ns(&t);
 }
 
 static inline int stopping(void)
@@ -735,6 +768,8 @@ static void usage(const char *p)
         "  -r         read the real Pi thermal sensor every period\n"
         "  -D us      soft deadline on wake-up latency (default = period)\n"
         "  -x         printf every sample inside the timed loop (naive sleeploop style)\n"
+        "  -Q         attribution mode: per sample, record runqueue wait during the sleep,\n"
+        "             and (with -r) CPU / wait / blocked time and context switches of the read\n"
         "  -W ms      warm-up before measuring (default 1000)\n"
         "Critter units as background load (program types):\n"
         "  -c n       compute threads (HVAC prediction: AR model + Monte Carlo)\n"
@@ -811,7 +846,7 @@ static void write_summary_row(const char *pol_desc, long online, int allowed,
 int main(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "p:n:m:rD:xW:c:d:w:i:Sf:N:T:H:s:P:a:A:lt:o:R:L:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:n:m:rD:xQW:c:d:w:i:Sf:N:T:H:s:P:a:A:lt:o:R:L:h")) != -1) {
         switch (opt) {
         case 'p': cfg.period_us = atol(optarg); break;
         case 'n': cfg.nsamples = atol(optarg); break;
@@ -824,6 +859,7 @@ int main(int argc, char **argv)
         case 'r': cfg.read_sensor = 1; break;
         case 'D': cfg.deadline_us = atol(optarg); break;
         case 'x': cfg.live_print = 1; break;
+        case 'Q': cfg.attrib = 1; break;
         case 'W': cfg.warmup_ms = atol(optarg); break;
         case 'c': cfg.n_compute = atoi(optarg); break;
         case 'd': cfg.n_data = atoi(optarg); break;
@@ -910,6 +946,18 @@ int main(int argc, char **argv)
     if (cfg.read_sensor && tfd < 0)
         fprintf(stderr, "note: %s not available, -r will time a failed read\n", THERMAL_PATH);
 
+    int sfd = -1;
+    int64_t last_wait = 0;
+    if (cfg.attrib) {
+        sfd = open("/proc/thread-self/schedstat", O_RDONLY);
+        if (sfd < 0 || read_wait_ns(sfd, &last_wait) != 0) {
+            fprintf(stderr, "note: schedstat unavailable, -Q disabled\n");
+            if (sfd >= 0) close(sfd);
+            sfd = -1;
+            cfg.attrib = 0;
+        }
+    }
+
     double temp0 = read_temp_c();
     long   freq0 = read_sysfs_long(FREQ_PATH);
     freq0 = freq0 < 0 ? -1 : freq0 / 1000;
@@ -953,19 +1001,51 @@ int main(int argc, char **argv)
         int64_t wake = now_ns();
         int64_t work = 0;
         int32_t temp = 0;
+        int64_t w_sleep = 0, rd_cpu = 0, rd_wait = 0;
+        int32_t rd_v = 0, rd_iv = 0;
+        if (cfg.attrib) {            /* wait accrued during sleep + wake-up */
+            int64_t w1;
+            if (read_wait_ns(sfd, &w1) == 0) {
+                w_sleep = w1 - last_wait;
+                last_wait = w1;
+            }
+        }
         if (cfg.read_sensor) {
+            struct rusage a, b2;
+            int64_t c0 = 0, t0 = wake;
+            if (cfg.attrib) {
+                getrusage(RUSAGE_THREAD, &a);
+                c0 = thread_cpu_ns();
+                t0 = now_ns();       /* time the read itself, not the bookkeeping */
+            }
             ssize_t r = (tfd >= 0) ? pread(tfd, rb, sizeof rb - 1, 0) : -1;
             if (r > 0) {
                 rb[r] = '\0';
                 temp = (int32_t)strtol(rb, NULL, 10);
             }
-            work = now_ns() - wake;
+            work = now_ns() - t0;
+            if (cfg.attrib) {
+                int64_t w2;
+                rd_cpu = thread_cpu_ns() - c0;
+                getrusage(RUSAGE_THREAD, &b2);
+                rd_v = (int32_t)(b2.ru_nvcsw - a.ru_nvcsw);
+                rd_iv = (int32_t)(b2.ru_nivcsw - a.ru_nivcsw);
+                if (read_wait_ns(sfd, &w2) == 0) {
+                    rd_wait = w2 - last_wait;
+                    last_wait = w2;
+                }
+            }
         }
 
         smp[i].lat_ns = wake - intended;
         smp[i].work_ns = work;
         smp[i].interval_ns = wake - prev_wake;
         smp[i].temp_mc = temp;
+        smp[i].sleep_wait_ns = w_sleep;
+        smp[i].rd_cpu_ns = rd_cpu;
+        smp[i].rd_wait_ns = rd_wait;
+        smp[i].rd_vcsw = rd_v;
+        smp[i].rd_ivcsw = rd_iv;
         if (smp[i].lat_ns > deadline_ns)
             misses++;
         if (i == 0)
@@ -1055,11 +1135,18 @@ int main(int argc, char **argv)
     if (cfg.csv_path[0]) {
         FILE *f = fopen(cfg.csv_path, "w");
         if (f) {
-            fprintf(f, "i,lat_ns,work_ns,interval_ns,temp_mC\n");
-            for (long i = 0; i < cfg.nsamples; i++)
-                fprintf(f, "%ld,%lld,%lld,%lld,%d\n", i,
+            fprintf(f, "i,lat_ns,work_ns,interval_ns,temp_mC%s\n",
+                    cfg.attrib ? ",sleep_wait_ns,rd_cpu_ns,rd_wait_ns,rd_vcsw,rd_ivcsw" : "");
+            for (long i = 0; i < cfg.nsamples; i++) {
+                fprintf(f, "%ld,%lld,%lld,%lld,%d", i,
                         (long long)smp[i].lat_ns, (long long)smp[i].work_ns,
                         (long long)smp[i].interval_ns, smp[i].temp_mc);
+                if (cfg.attrib)
+                    fprintf(f, ",%lld,%lld,%lld,%d,%d", (long long)smp[i].sleep_wait_ns,
+                            (long long)smp[i].rd_cpu_ns, (long long)smp[i].rd_wait_ns,
+                            smp[i].rd_vcsw, smp[i].rd_ivcsw);
+                fputc('\n', f);
+            }
             fclose(f);
         } else {
             perror(cfg.csv_path);
@@ -1069,6 +1156,8 @@ int main(int argc, char **argv)
         write_summary_row(pol_desc, online_cpus, allowed_cpus, &L, &I, &Wk,
                           misses, overruns, hz, &d, temp0, temp1, freq0, freq1);
 
+    if (sfd >= 0)
+        close(sfd);
     free(smp);
     free(tmp);
     return 0;
