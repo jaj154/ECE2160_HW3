@@ -1,0 +1,34 @@
+
+Q1. Late wake-ups (> 1 ms): how much of the lateness is runqueue wait?
+run                            late n  median wait/lat  >=80% wait  time explained  median late us  in 3.5-4.5 ms
+mech-q_c1                          12             0.99        100%             99%            4261            25%
+mech-q_c2                          25             0.98        100%             98%            2807            24%
+mech-q_c4                          48             0.99        100%             99%            3836            81%
+mech-q_c8                         549             0.99        100%             98%            3834            70%
+mech-sens_c2                       40             0.99        100%             99%            3687            25%
+mech-sens_d2                       49             0.98        100%             99%            2805            22%
+mech-sens_fifo_i1                   0   (no wake-up later than 1 ms)
+mech-sens_fifo_mix                  0   (no wake-up later than 1 ms)
+mech-sens_fifo_mixnoio              0   (no wake-up later than 1 ms)
+mech-sens_i1                       19             0.98        100%             98%            2671            26%
+mech-sens_i2                      266             0.98        100%             98%            2417            11%
+mech-sens_mix                     380             0.98        100%             98%            3370             7%
+mech-sens_mixnoio                 154             0.99        100%             98%            3784            83%
+mech-sens_n1                       44             0.98        100%             98%            2701             7%
+mech-sens_none                     11             0.96        100%             97%            1563            18%
+
+Q2. Sensor reads: how often does a read stall (> 1 ms), and what is a stall made of?
+run                             stall %  stall n    p99 us    max us    CPU   wait  BLOCKED  >=1 vol >=1 invol
+mech-sens_c2                       0.00        0         3       257   (no read longer than 1 ms)
+mech-sens_d2                       0.00        0         3       620   (no read longer than 1 ms)
+mech-sens_fifo_i1                  0.16       16         9      4990     0%     0%     100%     100%        0%
+mech-sens_fifo_mix                 5.47      547     17570     22714     0%     0%     100%     100%        0%
+mech-sens_fifo_mixnoio             0.00        0         3         5   (no read longer than 1 ms)
+mech-sens_i1                       0.17       17         5      5123     0%    66%      34%     100%        0%
+mech-sens_i2                       0.30       30        19      8129     0%    51%      49%     100%        0%
+mech-sens_mix                      4.30      430     23322     47423     0%    13%      87%     100%        8%
+mech-sens_mixnoio                  0.00        0         3       391   (no read longer than 1 ms)
+mech-sens_n1                       0.00        0         3       337   (no read longer than 1 ms)
+mech-sens_none                     0.00        0         3       138   (no read longer than 1 ms)
+
+Wrote results_final/mechanism_summary.csv and plots in results_final/plots
